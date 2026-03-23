@@ -36,6 +36,19 @@ EOF
 
 ensure_nitro_log_path
 
+# Source-installed Nitro CLI expects blob assets next to its installation root, not
+# in the distro default path. Prefer the colocated blobs automatically when present.
+if [[ -z "${NITRO_CLI_BLOBS:-}" ]]; then
+  NITRO_CLI_BIN="$(command -v nitro-cli || true)"
+  if [[ -n "$NITRO_CLI_BIN" ]]; then
+    NITRO_CLI_ROOT="$(cd "$(dirname "$NITRO_CLI_BIN")/.." && pwd)"
+    COLOCATED_BLOBS="$NITRO_CLI_ROOT/usr/share/nitro_enclaves/blobs"
+    if [[ -d "$COLOCATED_BLOBS" ]]; then
+      export NITRO_CLI_BLOBS="$COLOCATED_BLOBS"
+    fi
+  fi
+fi
+
 echo "[1/3] Building enclave image: $IMAGE_TAG"
 docker build -t "$IMAGE_TAG" "$ROOT_DIR"
 
