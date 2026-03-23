@@ -20,7 +20,14 @@ fi
 
 pushd "$BUILD_DIR" >/dev/null
 make nitro-cli
-cp build/bin/nitro-cli "$BIN_DIR/nitro-cli"
+if [[ -x build/nitro_cli/release/nitro-cli ]]; then
+  cp build/nitro_cli/release/nitro-cli "$BIN_DIR/nitro-cli"
+elif [[ -x build/bin/nitro-cli ]]; then
+  cp build/bin/nitro-cli "$BIN_DIR/nitro-cli"
+else
+  echo "Could not find built nitro-cli binary" >&2
+  exit 1
+fi
 popd >/dev/null
 
 echo "$BIN_DIR/nitro-cli"
