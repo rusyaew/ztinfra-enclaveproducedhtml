@@ -12,6 +12,8 @@ Canonical releases publish:
 - `ztbrowser-enclave.eif`
 - `describe-eif.json`
 - `provenance.json`
+- `release-manifest.json`
+- `coco-runtime-config.json`
 - `SHA256SUMS`
 
 `ztbrowser` consumes those release artifacts directly for real AWS deploys.

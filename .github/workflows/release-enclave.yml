@@ -84,8 +84,16 @@ jobs:
             --rust-version "$RUST_VERSION" \
             --cargo-version "$CARGO_VERSION" \
             --output-path build/provenance.json
-          (cd build && sha256sum ztbrowser-enclave.eif describe-eif.json provenance.json > SHA256SUMS)
-          python3 tools/render_facts_row.py --provenance build/provenance.json > build/facts-row.json
+          python3 tools/generate_release_manifest.py \
+            --service-config ztinfra-service.yaml \
+            --provenance build/provenance.json \
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+            --coco-image-digest "$IMAGE_DIGEST" \
+            --manifest-path build/release-manifest.json \
+            --coco-runtime-config-path build/coco-runtime-config.json
+          cp coco-wrapper/server.py build/coco-wrapper-server.py
+          (cd build && sha256sum ztbrowser-enclave.eif describe-eif.json provenance.json release-manifest.json coco-runtime-config.json coco-wrapper-server.py > SHA256SUMS)
+          python3 tools/render_facts_row.py --release-manifest build/release-manifest.json > build/facts-row.json
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
@@ -94,6 +102,9 @@ jobs:
             build/ztbrowser-enclave.eif
             build/describe-eif.json
             build/provenance.json
+            build/release-manifest.json
+            build/coco-runtime-config.json
+            build/coco-wrapper-server.py
             build/SHA256SUMS
 
       - name: Check out facts target repo
@@ -127,4 +138,4 @@ jobs:
             - commit_sha: ${{ github.sha }}
             - release_url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
 
-            The exact EFI/provenance values come from `build/provenance.json` in this release workflow.
+            The exact release identity values come from `build/release-manifest.json` in this release workflow.
