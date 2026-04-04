@@ -62,6 +62,8 @@ def main() -> None:
         build_env['cargo_version'] = args.cargo_version
 
     data = {
+        'service': args.repo_url.rstrip('/').split('/')[-1],
+        'release_id': args.release_tag,
         'workload_id': args.workload_id,
         'repo_url': args.repo_url,
         'project_repo_url': args.project_repo_url,
