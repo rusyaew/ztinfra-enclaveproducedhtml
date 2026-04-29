@@ -13,6 +13,14 @@ def sha256_hex_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def load_service_config(path: Path) -> dict:
     config: dict[str, object] = {}
     current_section: str | None = None
@@ -45,6 +53,7 @@ def main() -> None:
     parser.add_argument('--provenance', required=True)
     parser.add_argument('--release-url', required=True)
     parser.add_argument('--coco-image-digest', required=True)
+    parser.add_argument('--coco-initdata-path', required=True)
     parser.add_argument('--manifest-path', required=True)
     parser.add_argument('--coco-runtime-config-path', required=True)
     args = parser.parse_args()
@@ -55,15 +64,7 @@ def main() -> None:
 
     release_id = provenance['release_tag']
     service = service_config.get('service') or provenance['repo_url'].rstrip('/').split('/')[-1]
-    initdata_inputs = {
-        'service': service,
-        'release_id': release_id,
-        'platform': coco.get('platform', 'aws_coco_snp'),
-        'image_digest': args.coco_image_digest,
-        'aa_evidence_url': coco.get('aa_evidence_url', 'http://127.0.0.1:8006/aa/evidence'),
-        'attestation_path': coco.get('attestation_path', '/.well-known/attestation'),
-    }
-    initdata_hash = sha256_hex_bytes(stable_json(initdata_inputs))
+    initdata_hash = sha256_file(Path(args.coco_initdata_path))
     identity_hint = f"coco_image_initdata:{args.coco_image_digest}:{initdata_hash}"
 
     runtime_config = {
@@ -73,8 +74,8 @@ def main() -> None:
         'image_digest': args.coco_image_digest,
         'initdata_hash': initdata_hash,
         'identity_hint': identity_hint,
-        'aa_evidence_url': initdata_inputs['aa_evidence_url'],
-        'attestation_path': initdata_inputs['attestation_path'],
+        'aa_evidence_url': coco.get('aa_evidence_url', 'http://127.0.0.1:8006/aa/evidence'),
+        'attestation_path': coco.get('attestation_path', '/.well-known/attestation'),
         'facts_url': 'https://facts-db.onrender.com',
         'workload_pubkey': None,
     }
@@ -87,6 +88,13 @@ def main() -> None:
         'project_repo_url': provenance['project_repo_url'],
         'release_url': args.release_url,
         'source_image_digest': provenance['oci_image_digest'],
+        'source_container': {
+            'image_digest': provenance['oci_image_digest'],
+            'dockerfile': 'Dockerfile',
+            'lockfile': 'Cargo.lock',
+            'description': 'Canonical source container. Nitro EIF and CoCo workload deployment are lowered from this container image/build context.',
+            'coco_image_ref': 'coco-image-ref.txt',
+        },
         'legacy_workload_id': provenance['workload_id'],
         'canonical': True,
         'notes': f"Canonical release manifest for {release_id} from {provenance['repo_url']}",
@@ -107,6 +115,10 @@ def main() -> None:
                     'describe_eif': 'describe-eif.json',
                     'provenance': 'provenance.json',
                 },
+                'lowered_from': {
+                    'type': 'source_container',
+                    'image_digest': provenance['oci_image_digest'],
+                },
             },
             {
                 'platform': runtime_config['platform'],
@@ -119,6 +131,14 @@ def main() -> None:
                 },
                 'assets': {
                     'runtime_config': 'coco-runtime-config.json',
+                    'initdata': 'coco-initdata.json',
+                    'image_digest': 'coco-image-digest.txt',
+                    'image_ref': 'coco-image-ref.txt',
+                    'image_oci_archive': 'coco-workload.oci.tar',
+                },
+                'lowered_from': {
+                    'type': 'source_container',
+                    'image_digest': provenance['oci_image_digest'],
                 },
             },
         ],

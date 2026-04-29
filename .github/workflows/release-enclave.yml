@@ -65,6 +65,14 @@ jobs:
           echo "CARGO_VERSION=$(cargo --version | awk '{print $2}')" >> "$GITHUB_ENV"
           echo "NITRO_CLI_VERSION=$(nitro-cli --version | awk '{print $NF}')" >> "$GITHUB_ENV"
 
+      - name: Build reproducible CoCo workload image
+        env:
+          COCO_IMAGE_REF: ghcr.io/${{ github.repository_owner }}/ztinfra-enclaveproducedhtml:${{ github.ref_name }}
+        run: |
+          COCO_DEPLOY_IMAGE_DIGEST="$IMAGE_DIGEST" scripts/build-coco-image.sh build
+          COCO_IMAGE_DIGEST="$(cat build/coco-image-digest.txt)"
+          echo "COCO_IMAGE_DIGEST=$COCO_IMAGE_DIGEST" >> "$GITHUB_ENV"
+
       - name: Generate provenance and checksums
         run: |
           python3 tools/generate_provenance.py \
@@ -84,15 +92,28 @@ jobs:
             --rust-version "$RUST_VERSION" \
             --cargo-version "$CARGO_VERSION" \
             --output-path build/provenance.json
+          python3 tools/generate_coco_artifacts.py \
+            --service-config ztinfra-service.yaml \
+            --release-id "${GITHUB_REF_NAME}" \
+            --coco-image-digest "$COCO_IMAGE_DIGEST" \
+            --initdata-path build/coco-initdata.json \
+            --runtime-config-path build/coco-runtime-config.json
           python3 tools/generate_release_manifest.py \
             --service-config ztinfra-service.yaml \
             --provenance build/provenance.json \
             --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
-            --coco-image-digest "$IMAGE_DIGEST" \
+            --coco-image-digest "$COCO_IMAGE_DIGEST" \
+            --coco-initdata-path build/coco-initdata.json \
             --manifest-path build/release-manifest.json \
             --coco-runtime-config-path build/coco-runtime-config.json
           cp coco-wrapper/server.py build/coco-wrapper-server.py
-          (cd build && sha256sum ztbrowser-enclave.eif describe-eif.json provenance.json release-manifest.json coco-runtime-config.json coco-wrapper-server.py > SHA256SUMS)
+          python3 tools/verify_coco_release.py \
+            --release-manifest build/release-manifest.json \
+            --runtime-config build/coco-runtime-config.json \
+            --initdata build/coco-initdata.json \
+            --coco-image-digest build/coco-image-digest.txt \
+            --oci-archive build/coco-workload.oci.tar
+          (cd build && sha256sum ztbrowser-enclave.eif describe-eif.json provenance.json release-manifest.json coco-runtime-config.json coco-initdata.json coco-image-digest.txt coco-image-ref.txt coco-oci-manifest-digest.txt coco-workload.oci.tar coco-workload.oci.tar.sha256 coco-wrapper-server.py > SHA256SUMS)
           python3 tools/render_facts_row.py --release-manifest build/release-manifest.json > build/facts-row.json
 
       - name: Publish GitHub release assets
@@ -104,6 +125,12 @@ jobs:
             build/provenance.json
             build/release-manifest.json
             build/coco-runtime-config.json
+            build/coco-initdata.json
+            build/coco-image-digest.txt
+            build/coco-image-ref.txt
+            build/coco-oci-manifest-digest.txt
+            build/coco-workload.oci.tar
+            build/coco-workload.oci.tar.sha256
             build/coco-wrapper-server.py
             build/SHA256SUMS
 
