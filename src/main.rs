@@ -2,15 +2,22 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use aws_nitro_enclaves_nsm_api::api::{Request, Response};
 use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature, SigningKey};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256, Sha512};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
@@ -21,12 +28,31 @@ const DEFAULT_COCO_CONFIG_PATH: &str = "/app/coco-runtime-config.json";
 const DEFAULT_REPO_URL: &str = "https://github.com/rusyaew/ztinfra-enclaveproducedhtml";
 const DEFAULT_PROJECT_REPO_URL: &str = "https://github.com/rusyaew/ztbrowser";
 const DEFAULT_WORKLOAD_ID: &str = "ztbrowser-aws-nitro";
+const ATTESTED_RESPONSE_VERSION: &str = "zt-attested-response/v1";
+const NITRO_PLATFORM: &str = "aws_nitro_eif";
+const COCO_PLATFORM: &str = "aws_coco_snp";
+
+static RESPONSE_SIGNING_KEY: OnceLock<SigningKey> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct EnclaveRequest {
     action: String,
     #[serde(default)]
     nonce_hex: Option<String>,
+    #[serde(default)]
+    response_challenge: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    release_id: Option<String>,
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    facts_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -37,6 +63,38 @@ struct EnclaveResponse {
     html: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attestation_doc_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attestation_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_signing_key: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_signing_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_signing_key_binding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signed_response: Option<SignedResponseHeaders>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SignedResponseHeaders {
+    version: String,
+    key_id: String,
+    content_digest: String,
+    signature: String,
+    signed_at: u128,
+    challenge: String,
+}
+
+#[derive(Clone)]
+struct ResponseSigningContext<'a> {
+    method: &'a str,
+    path: &'a str,
+    status: u16,
+    content_type: &'a str,
+    challenge: &'a str,
+    service: &'a str,
+    release_id: &'a str,
+    platform: &'a str,
 }
 
 #[tokio::main]
@@ -85,22 +143,125 @@ async fn handle_connection(stream: tokio_vsock::VsockStream) -> Result<()> {
     let request: EnclaveRequest =
         serde_json::from_str(request_line.trim()).context("Request is not valid JSON")?;
     let response = match request.action.as_str() {
-        "index" => EnclaveResponse {
-            content_type: Some("text/html; charset=utf-8".to_string()),
-            html: Some(render_index_html()),
-            attestation_doc_b64: None,
-        },
+        "index" => {
+            let content_type = "text/html; charset=utf-8";
+            let html = render_index_html();
+            let service = request.service.as_deref().unwrap_or(DEFAULT_WORKLOAD_ID);
+            let release_id = request.release_id.as_deref().unwrap_or(DEFAULT_WORKLOAD_ID);
+            let platform = request.platform.as_deref().unwrap_or(NITRO_PLATFORM);
+            let signed_response = request
+                .response_challenge
+                .as_deref()
+                .map(|challenge| {
+                    sign_response_headers(
+                        html.as_bytes(),
+                        ResponseSigningContext {
+                            method: request.method.as_deref().unwrap_or("GET"),
+                            path: request.path.as_deref().unwrap_or("/"),
+                            status: 200,
+                            content_type,
+                            challenge,
+                            service,
+                            release_id,
+                            platform,
+                        },
+                    )
+                })
+                .transpose()?;
+            EnclaveResponse {
+                content_type: Some(content_type.to_string()),
+                html: Some(html),
+                attestation_doc_b64: None,
+                attestation_json: None,
+                response_signing_key: None,
+                response_signing_key_id: None,
+                response_signing_key_binding: None,
+                signed_response,
+            }
+        }
         "attestation" => {
             let nonce_hex = request
                 .nonce_hex
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("nonce_hex is required for attestation requests"))?;
             let nonce = parse_nonce_hex(nonce_hex)?;
-            let attestation_doc_b64 = request_attestation_doc(nonce)?;
+            let service = request.service.as_deref().unwrap_or(DEFAULT_WORKLOAD_ID);
+            let release_id = request.release_id.as_deref().unwrap_or(DEFAULT_WORKLOAD_ID);
+            let platform = request.platform.as_deref().unwrap_or(NITRO_PLATFORM);
+            let public_jwk = response_signing_public_jwk();
+            let key_id = response_signing_key_id()?;
+            let binding = response_signing_binding_hash(
+                nonce_hex,
+                &key_id,
+                &public_jwk,
+                service,
+                release_id,
+                platform,
+                BindingHash::Sha256,
+            )?;
+            let public_key = canonical_json(&public_jwk)?;
+            let binding_bytes = hex_to_bytes(&binding)?;
+            let attestation_doc_b64 = request_attestation_doc(
+                nonce,
+                Some(public_key.as_bytes().to_vec()),
+                Some(binding_bytes),
+            )?;
+            let envelope = json!({
+                "version": "ztinfra-attestation/v1",
+                "service": service,
+                "release_id": release_id,
+                "platform": platform,
+                "nonce": nonce_hex,
+                "claims": {
+                    "workload_pubkey": Value::Null,
+                    "identity_hint": Value::Null,
+                    "response_signing_key": public_jwk.clone(),
+                    "response_signing_key_id": key_id.clone(),
+                    "response_signing_key_binding": binding.clone(),
+                },
+                "evidence": {
+                    "type": "aws_nitro_attestation_doc",
+                    "payload": {
+                        "nitro_attestation_doc_b64": attestation_doc_b64,
+                    },
+                },
+                "facts_url": request.facts_url.clone().map(Value::String).unwrap_or(Value::Null),
+            });
+            let payload = serde_json::to_vec(&envelope)?;
+            let signed_response = request
+                .response_challenge
+                .as_deref()
+                .map(|challenge| {
+                    sign_response_headers(
+                        &payload,
+                        ResponseSigningContext {
+                            method: request.method.as_deref().unwrap_or("POST"),
+                            path: request
+                                .path
+                                .as_deref()
+                                .unwrap_or("/.well-known/attestation"),
+                            status: 200,
+                            content_type: "application/json",
+                            challenge,
+                            service,
+                            release_id,
+                            platform,
+                        },
+                    )
+                })
+                .transpose()?;
             EnclaveResponse {
                 content_type: None,
                 html: None,
-                attestation_doc_b64: Some(attestation_doc_b64),
+                attestation_doc_b64: None,
+                attestation_json: Some(
+                    String::from_utf8(payload)
+                        .context("Attestation envelope JSON was not UTF-8")?,
+                ),
+                response_signing_key: Some(public_jwk),
+                response_signing_key_id: Some(key_id),
+                response_signing_key_binding: Some(binding),
+                signed_response,
             }
         }
         other => bail!("Unsupported action: {other}"),
@@ -166,6 +327,7 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
             400,
             "text/plain; charset=utf-8",
             b"bad_request",
+            None,
         )?;
         return Ok(());
     }
@@ -173,6 +335,7 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
     let method = parts[0];
     let path = parts[1];
     let mut content_length = 0usize;
+    let mut response_challenge: Option<String> = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -183,6 +346,8 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("x-zt-challenge") {
+                response_challenge = Some(value.trim().to_string());
             }
         }
     }
@@ -190,11 +355,38 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
     match (method, path) {
         ("GET", "/") => {
             let html = render_coco_index_html();
+            let signed = if let Some(challenge) = response_challenge.as_deref() {
+                let config = load_coco_config()?;
+                let service = config["service"]
+                    .as_str()
+                    .unwrap_or("ztinfra-enclaveproducedhtml");
+                let release_id = config["release_id"].as_str().unwrap_or("unknown-release");
+                let platform = config
+                    .get("platform")
+                    .and_then(Value::as_str)
+                    .unwrap_or(COCO_PLATFORM);
+                Some(sign_response_headers(
+                    html.as_bytes(),
+                    ResponseSigningContext {
+                        method,
+                        path,
+                        status: 200,
+                        content_type: "text/html; charset=utf-8",
+                        challenge,
+                        service,
+                        release_id,
+                        platform,
+                    },
+                )?)
+            } else {
+                None
+            };
             write_http_response(
                 &mut stream,
                 200,
                 "text/html; charset=utf-8",
                 html.as_bytes(),
+                signed.as_ref(),
             )?;
         }
         ("POST", "/.well-known/attestation") => {
@@ -211,12 +403,31 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
             parse_nonce_hex(&nonce)?;
 
             let config = load_coco_config()?;
+            let service = config["service"]
+                .as_str()
+                .unwrap_or("ztinfra-enclaveproducedhtml");
+            let release_id = config["release_id"].as_str().unwrap_or("unknown-release");
+            let platform = config
+                .get("platform")
+                .and_then(Value::as_str)
+                .unwrap_or(COCO_PLATFORM);
+            let public_jwk = response_signing_public_jwk();
+            let key_id = response_signing_key_id()?;
+            let binding = response_signing_binding_hash(
+                &nonce,
+                &key_id,
+                &public_jwk,
+                service,
+                release_id,
+                platform,
+                BindingHash::Sha512,
+            )?;
             let evidence = fetch_coco_aa_evidence(
                 config
                     .get("aa_evidence_url")
                     .and_then(Value::as_str)
                     .unwrap_or("http://127.0.0.1:8006/aa/evidence"),
-                &nonce,
+                &binding,
             )?;
             let identity_hint = config
                 .get("identity_hint")
@@ -233,11 +444,14 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
                 "version": "ztinfra-attestation/v1",
                 "service": config["service"],
                 "release_id": config["release_id"],
-                "platform": config.get("platform").and_then(Value::as_str).unwrap_or("aws_coco_snp"),
+                "platform": platform,
                 "nonce": nonce,
                 "claims": {
                     "workload_pubkey": config.get("workload_pubkey").cloned().unwrap_or(Value::Null),
                     "identity_hint": identity_hint,
+                    "response_signing_key": public_jwk,
+                    "response_signing_key_id": key_id,
+                    "response_signing_key_binding": binding,
                 },
                 "evidence": {
                     "type": "coco_trustee_evidence",
@@ -246,9 +460,46 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
                 "facts_url": config.get("facts_url").cloned().unwrap_or(Value::Null),
             });
             let payload = serde_json::to_vec(&envelope)?;
-            write_http_response(&mut stream, 200, "application/json", &payload)?;
+            let signed = sign_response_if_challenged(
+                response_challenge.as_deref(),
+                &payload,
+                ResponseSigningContext {
+                    method,
+                    path,
+                    status: 200,
+                    content_type: "application/json",
+                    challenge: "",
+                    service,
+                    release_id,
+                    platform,
+                },
+            )?;
+            write_http_response(
+                &mut stream,
+                200,
+                "application/json",
+                &payload,
+                signed.as_ref(),
+            )?;
         }
-        _ => write_http_response(&mut stream, 404, "text/plain; charset=utf-8", b"not_found")?,
+        _ => {
+            let body = b"not_found";
+            let signed = sign_coco_response_if_challenged(
+                response_challenge.as_deref(),
+                body,
+                method,
+                path,
+                404,
+                "text/plain; charset=utf-8",
+            )?;
+            write_http_response(
+                &mut stream,
+                404,
+                "text/plain; charset=utf-8",
+                body,
+                signed.as_ref(),
+            )?
+        }
     }
 
     Ok(())
@@ -259,6 +510,7 @@ fn write_http_response(
     status: u16,
     content_type: &str,
     body: &[u8],
+    signed_response: Option<&SignedResponseHeaders>,
 ) -> Result<()> {
     let reason = match status {
         200 => "OK",
@@ -266,13 +518,207 @@ fn write_http_response(
         404 => "Not Found",
         _ => "Internal Server Error",
     };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
+    write!(stream, "HTTP/1.1 {status} {reason}\r\n")?;
+    write!(stream, "Content-Type: {content_type}\r\n")?;
+    write!(stream, "Content-Length: {}\r\n", body.len())?;
+    if let Some(headers) = signed_response {
+        write!(stream, "X-ZT-Signature-Version: {}\r\n", headers.version)?;
+        write!(stream, "X-ZT-Key-Id: {}\r\n", headers.key_id)?;
+        write!(
+            stream,
+            "X-ZT-Content-Digest: {}\r\n",
+            headers.content_digest
+        )?;
+        write!(stream, "X-ZT-Signature: {}\r\n", headers.signature)?;
+        write!(stream, "X-ZT-Signed-At: {}\r\n", headers.signed_at)?;
+        write!(stream, "X-ZT-Challenge: {}\r\n", headers.challenge)?;
+    }
+    write!(stream, "Connection: close\r\n\r\n")?;
     stream.write_all(body)?;
     Ok(())
+}
+
+fn sign_coco_response_if_challenged(
+    challenge: Option<&str>,
+    body: &[u8],
+    method: &str,
+    path: &str,
+    status: u16,
+    content_type: &str,
+) -> Result<Option<SignedResponseHeaders>> {
+    let Some(challenge) = challenge else {
+        return Ok(None);
+    };
+    let release_id = env::var("RELEASE_ID").unwrap_or_else(|_| "unknown-release".to_string());
+    Ok(Some(sign_response_headers(
+        body,
+        ResponseSigningContext {
+            method,
+            path,
+            status,
+            content_type,
+            challenge,
+            service: "ztinfra-enclaveproducedhtml",
+            release_id: &release_id,
+            platform: COCO_PLATFORM,
+        },
+    )?))
+}
+
+fn sign_response_if_challenged(
+    challenge: Option<&str>,
+    body: &[u8],
+    context: ResponseSigningContext<'_>,
+) -> Result<Option<SignedResponseHeaders>> {
+    let Some(challenge) = challenge else {
+        return Ok(None);
+    };
+    sign_response_headers(
+        body,
+        ResponseSigningContext {
+            challenge,
+            ..context
+        },
+    )
+    .map(Some)
+}
+
+#[derive(Clone, Copy)]
+enum BindingHash {
+    Sha256,
+    Sha512,
+}
+
+fn response_signing_key() -> &'static SigningKey {
+    RESPONSE_SIGNING_KEY.get_or_init(|| SigningKey::random(&mut OsRng))
+}
+
+fn response_signing_public_jwk() -> Value {
+    let verifying_key = response_signing_key().verifying_key();
+    let encoded = verifying_key.to_encoded_point(false);
+    let x = encoded
+        .x()
+        .expect("P-256 public key must include x coordinate");
+    let y = encoded
+        .y()
+        .expect("P-256 public key must include y coordinate");
+    json!({
+        "crv": "P-256",
+        "ext": true,
+        "key_ops": ["verify"],
+        "kty": "EC",
+        "x": BASE64_URL_SAFE_NO_PAD.encode(x),
+        "y": BASE64_URL_SAFE_NO_PAD.encode(y),
+    })
+}
+
+fn response_signing_key_id() -> Result<String> {
+    let canonical = canonical_json(&response_signing_public_jwk())?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    Ok(format!("sha256:{}", BASE64_URL_SAFE_NO_PAD.encode(digest)))
+}
+
+fn response_signing_binding_hash(
+    nonce: &str,
+    key_id: &str,
+    public_jwk: &Value,
+    service: &str,
+    release_id: &str,
+    platform: &str,
+    hash: BindingHash,
+) -> Result<String> {
+    let context = json!({
+        "key_id": key_id,
+        "platform": platform,
+        "public_jwk": canonical_value(public_jwk),
+        "release_id": release_id,
+        "service": service,
+        "nonce": nonce,
+        "version": ATTESTED_RESPONSE_VERSION,
+    });
+    let canonical = canonical_json(&context)?;
+    let bytes = canonical.as_bytes();
+    Ok(match hash {
+        BindingHash::Sha256 => hex_encode(&Sha256::digest(bytes)),
+        BindingHash::Sha512 => hex_encode(&Sha512::digest(bytes)),
+    })
+}
+
+fn sign_response_headers(
+    body: &[u8],
+    context: ResponseSigningContext<'_>,
+) -> Result<SignedResponseHeaders> {
+    let key_id = response_signing_key_id()?;
+    let content_digest = format!("sha-256=:{}:", BASE64_STANDARD.encode(Sha256::digest(body)));
+    let signed_at = now_millis()?;
+    let payload = json!({
+        "challenge": context.challenge,
+        "content_digest": content_digest,
+        "content_type": normalize_content_type(context.content_type),
+        "key_id": key_id,
+        "method": context.method.to_ascii_uppercase(),
+        "path": context.path,
+        "platform": context.platform,
+        "release_id": context.release_id,
+        "service": context.service,
+        "signed_at": signed_at,
+        "status": context.status,
+        "version": ATTESTED_RESPONSE_VERSION,
+    });
+    let canonical = canonical_json(&payload)?;
+    let signature: Signature = response_signing_key().sign(canonical.as_bytes());
+    Ok(SignedResponseHeaders {
+        version: ATTESTED_RESPONSE_VERSION.to_string(),
+        key_id,
+        content_digest,
+        signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        signed_at,
+        challenge: context.challenge.to_string(),
+    })
+}
+
+fn normalize_content_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn now_millis() -> Result<u128> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_millis())
+}
+
+fn canonical_json(value: &Value) -> Result<String> {
+    serde_json::to_string(&canonical_value(value)).context("Could not serialize canonical JSON")
+}
+
+fn canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
+        Value::Object(object) => {
+            let mut sorted = Map::new();
+            let mut keys: Vec<&String> = object.keys().collect();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_value(&object[key]));
+            }
+            Value::Object(sorted)
+        }
+        other => other.clone(),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_to_bytes(value: &str) -> Result<Vec<u8>> {
+    parse_nonce_hex(value)
 }
 
 fn render_coco_index_html() -> String {
@@ -325,7 +771,11 @@ fn fetch_coco_aa_evidence(aa_evidence_url: &str, nonce_hex: &str) -> Result<Valu
     serde_json::from_str(body).context("AA evidence response is not valid JSON")
 }
 
-fn request_attestation_doc(nonce: Vec<u8>) -> Result<String> {
+fn request_attestation_doc(
+    nonce: Vec<u8>,
+    public_key: Option<Vec<u8>>,
+    user_data: Option<Vec<u8>>,
+) -> Result<String> {
     let nsm_fd = nsm_init();
     if nsm_fd < 0 {
         bail!("Could not open /dev/nsm");
@@ -334,9 +784,9 @@ fn request_attestation_doc(nonce: Vec<u8>) -> Result<String> {
     let response = nsm_process_request(
         nsm_fd,
         Request::Attestation {
-            user_data: None,
+            user_data: user_data.map(ByteBuf::from),
             nonce: Some(ByteBuf::from(nonce)),
-            public_key: None,
+            public_key: public_key.map(ByteBuf::from),
         },
     );
     nsm_exit(nsm_fd);
@@ -366,4 +816,101 @@ fn parse_nonce_hex(value: &str) -> Result<Vec<u8>> {
     }
 
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::VerifyingKey;
+    use p256::EncodedPoint;
+
+    fn public_key_from_jwk(jwk: &Value) -> VerifyingKey {
+        let x = BASE64_URL_SAFE_NO_PAD
+            .decode(jwk["x"].as_str().expect("jwk x"))
+            .expect("x base64url");
+        let y = BASE64_URL_SAFE_NO_PAD
+            .decode(jwk["y"].as_str().expect("jwk y"))
+            .expect("y base64url");
+        let point = EncodedPoint::from_affine_coordinates((&x[..]).into(), (&y[..]).into(), false);
+        VerifyingKey::from_encoded_point(&point).expect("valid P-256 public key")
+    }
+
+    #[test]
+    fn response_key_id_and_bindings_are_well_formed() {
+        let jwk = response_signing_public_jwk();
+        let key_id = response_signing_key_id().expect("key id");
+        assert!(key_id.starts_with("sha256:"));
+
+        let nitro = response_signing_binding_hash(
+            &"ab".repeat(32),
+            &key_id,
+            &jwk,
+            "ztinfra-enclaveproducedhtml",
+            "v0.2.2",
+            NITRO_PLATFORM,
+            BindingHash::Sha256,
+        )
+        .expect("nitro binding");
+        assert_eq!(nitro.len(), 64);
+
+        let coco = response_signing_binding_hash(
+            &"ab".repeat(32),
+            &key_id,
+            &jwk,
+            "ztinfra-enclaveproducedhtml",
+            "v0.2.2",
+            COCO_PLATFORM,
+            BindingHash::Sha512,
+        )
+        .expect("coco binding");
+        assert_eq!(coco.len(), 128);
+        assert_ne!(nitro, coco[..64]);
+    }
+
+    #[test]
+    fn signed_response_headers_verify_against_public_jwk() {
+        let body = b"<html>signed</html>";
+        let headers = sign_response_headers(
+            body,
+            ResponseSigningContext {
+                method: "GET",
+                path: "/?x=1",
+                status: 200,
+                content_type: "text/html; charset=utf-8",
+                challenge: &"cd".repeat(32),
+                service: "ztinfra-enclaveproducedhtml",
+                release_id: "v0.2.2",
+                platform: COCO_PLATFORM,
+            },
+        )
+        .expect("signed headers");
+        let payload = json!({
+            "challenge": headers.challenge,
+            "content_digest": headers.content_digest,
+            "content_type": "text/html",
+            "key_id": headers.key_id,
+            "method": "GET",
+            "path": "/?x=1",
+            "platform": COCO_PLATFORM,
+            "release_id": "v0.2.2",
+            "service": "ztinfra-enclaveproducedhtml",
+            "signed_at": headers.signed_at,
+            "status": 200,
+            "version": ATTESTED_RESPONSE_VERSION,
+        });
+        let canonical = canonical_json(&payload).expect("canonical payload");
+        let signature_bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(headers.signature)
+            .expect("signature base64url");
+        let signature = Signature::try_from(signature_bytes.as_slice()).expect("P1363 signature");
+        public_key_from_jwk(&response_signing_public_jwk())
+            .verify(canonical.as_bytes(), &signature)
+            .expect("signature verifies");
+
+        let tampered = canonical.replace("signed", "tampered");
+        assert!(public_key_from_jwk(&response_signing_public_jwk())
+            .verify(tampered.as_bytes(), &signature)
+            .is_err());
+    }
 }

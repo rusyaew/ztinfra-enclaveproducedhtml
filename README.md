@@ -29,6 +29,24 @@ CoCo are lowerings from that same container:
 - Nitro lowering: source container -> `ztbrowser-enclave.eif` -> PCR identity.
 - CoCo lowering: source container image + external Init-Data -> `image_digest + initdata_hash` identity.
 
+## Attested response signing
+
+The workload generates an ephemeral P-256 response signing key inside the trusted
+runtime. Attestation responses bind the public key into TEE evidence:
+
+- Nitro puts the canonical public JWK in the NSM attestation `public_key` field
+  and the SHA-256 response-key binding hash in `user_data`.
+- AWS CoCo requests AA evidence with `runtime_data` set to the SHA-512
+  response-key binding hash.
+
+The common attestation envelope exposes `claims.response_signing_key`,
+`claims.response_signing_key_id`, and `claims.response_signing_key_binding`.
+When a request includes `X-ZT-Challenge`, the workload signs the exact response
+body and returns `X-ZT-Signature-Version`, `X-ZT-Key-Id`,
+`X-ZT-Content-Digest`, `X-ZT-Signature`, `X-ZT-Signed-At`, and
+`X-ZT-Challenge`. Requests without `X-ZT-Challenge` remain valid unsigned
+responses for normal browser visits and health checks.
+
 GitHub release assets are distribution artifacts, not trust roots. A reviewer can
 rebuild the source container and lowerings locally, compare `SHA256SUMS`,
 `provenance.json`, `release-manifest.json`, `coco-oci-manifest-digest.txt`, and
